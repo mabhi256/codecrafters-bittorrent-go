@@ -32,6 +32,9 @@ func (d *BencodeDecoder) decodeBencode() (any, error) {
 	case d.data[d.pos] == 'l':
 		return d.decodeList()
 
+	case d.data[d.pos] == 'd':
+		return d.decodeDictionary()
+
 	default:
 		return "", fmt.Errorf("format not supported")
 
@@ -109,6 +112,28 @@ func (d *BencodeDecoder) decodeList() ([]any, error) {
 
 	d.pos++
 	return list, nil
+}
+
+func (d *BencodeDecoder) decodeDictionary() (map[string]any, error) {
+	d.pos++
+
+	dict := make(map[string]any)
+	for d.pos < len(d.data) && d.data[d.pos] != 'e' {
+		key, err := d.decodeString()
+		if err != nil {
+			return nil, err
+		}
+
+		value, err := d.decodeBencode()
+		if err != nil {
+			return nil, err
+		}
+
+		dict[key] = value
+	}
+
+	d.pos++
+	return dict, nil
 }
 
 func main() {
