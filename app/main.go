@@ -14,9 +14,9 @@ type BencodeDecoder struct {
 	pos  int
 }
 
-func NewBencodeDecoder(data string) *BencodeDecoder {
+func NewBencodeDecoder(data []byte) *BencodeDecoder {
 	return &BencodeDecoder{
-		data: []byte(data),
+		data: data,
 		pos:  0,
 	}
 }
@@ -142,9 +142,10 @@ func main() {
 
 	command := os.Args[1]
 
-	if command == "decode" {
+	switch command {
+	case "decode":
 		bencodedValue := os.Args[2]
-		decoder := NewBencodeDecoder(bencodedValue)
+		decoder := NewBencodeDecoder([]byte(bencodedValue))
 
 		decoded, err := decoder.decodeBencode()
 		if err != nil {
@@ -154,7 +155,27 @@ func main() {
 
 		jsonOutput, _ := json.Marshal(decoded)
 		fmt.Println(string(jsonOutput))
-	} else {
+
+	case "info":
+		torrent := os.Args[2]
+
+		file, err := os.ReadFile(torrent)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		decoder := NewBencodeDecoder(file)
+		decoded, err := decoder.decodeDictionary()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		fmt.Println("Tracker URL:", decoded["announce"])
+		fmt.Println("Length:", decoded["info"].(map[string]any)["length"])
+
+	default:
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
 	}
