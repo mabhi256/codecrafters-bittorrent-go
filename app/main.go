@@ -9,16 +9,28 @@ import (
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
 
-func decodeBencode(bencodedString string) (any, error) {
-	beginDelimiter := bencodedString[0]
-	endDelimiter := bencodedString[len(bencodedString)-1]
+type BencodeDecoder struct {
+	data []byte
+	pos  int
+}
 
+func NewBencodeDecoder(data string) *BencodeDecoder {
+	return &BencodeDecoder{
+		data: []byte(data),
+		pos:  0,
+	}
+}
+
+func (d *BencodeDecoder) decodeBencode() (any, error) {
 	switch {
-	case unicode.IsDigit(rune(beginDelimiter)):
-		return decodeString(bencodedString)
+	case unicode.IsDigit(rune(d.data[d.pos])):
+		return d.decodeString()
 
-	case string(beginDelimiter) == "i" && string(endDelimiter) == "e":
-		return decodeInteger(bencodedString)
+	case d.data[d.pos] == 'i':
+		return d.decodeInteger()
+
+	case d.data[d.pos] == 'l':
+		return d.decodeList()
 
 	default:
 		return "", fmt.Errorf("format not supported")
@@ -26,50 +38,77 @@ func decodeBencode(bencodedString string) (any, error) {
 	}
 }
 
-func decodeString(bencodedString string) (any, error) {
-	var firstColonIndex int
+func (d *BencodeDecoder) decodeString() (string, error) {
+	start := d.pos
 
-	for i := 0; i < len(bencodedString); i++ {
-		if bencodedString[i] == ':' {
-			firstColonIndex = i
+	for d.pos < len(d.data) {
+		if d.data[d.pos] == ':' {
 			break
 		}
+		d.pos++
 	}
 
-	lengthStr := bencodedString[:firstColonIndex]
+	lengthStr := string(d.data[start:d.pos])
 
 	length, err := strconv.Atoi(lengthStr)
 	if err != nil {
 		return "", err
 	}
 
-	return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
+	d.pos++
+	value := d.data[d.pos : d.pos+length]
+	d.pos += length
+
+	return string(value), nil
 }
 
-func decodeInteger(bencodedString string) (int, error) {
-	if bencodedString == "i-0e" {
-		return 0, fmt.Errorf("invalid integer encoding: %s", bencodedString)
-	}
+func (d *BencodeDecoder) decodeInteger() (int, error) {
+	d.pos++ // move pos beyond the beginning delimiter
 
-	if string(bencodedString[1]) == "0" && string(bencodedString[2]) != "e" {
-		return 0, fmt.Errorf("invalid integer encoding: %s", bencodedString)
-	}
-
-	var integerStr string
 	sign := 1
-	if string(bencodedString[1]) == "-" {
+	if string(d.data[d.pos]) == "-" {
 		sign = -1
-		integerStr = bencodedString[2 : len(bencodedString)-1]
-	} else {
-		integerStr = bencodedString[1 : len(bencodedString)-1]
+		d.pos++
 	}
 
-	integer, err := strconv.Atoi(integerStr)
+	var valueStr string
+
+	for d.pos < len(d.data) && string(d.data[d.pos]) != "e" {
+		valueStr += string(d.data[d.pos])
+		d.pos++
+	}
+
+	if valueStr == "-0" {
+		return 0, fmt.Errorf("invalid integer encoding: i-0e")
+	}
+
+	if valueStr[0] == '0' && len(valueStr) != 1 {
+		return 0, fmt.Errorf("invalid integer encoding: %s", d.data)
+	}
+
+	value, err := strconv.Atoi(valueStr)
 	if err != nil {
 		return 0, err
 	}
+	d.pos++
 
-	return sign * integer, nil
+	return sign * value, nil
+}
+
+func (d *BencodeDecoder) decodeList() ([]any, error) {
+	d.pos++
+
+	list := []any{}
+	for d.pos < len(d.data) && d.data[d.pos] != 'e' {
+		item, err := d.decodeBencode()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, item)
+	}
+
+	d.pos++
+	return list, nil
 }
 
 func main() {
@@ -80,8 +119,9 @@ func main() {
 
 	if command == "decode" {
 		bencodedValue := os.Args[2]
+		decoder := NewBencodeDecoder(bencodedValue)
 
-		decoded, err := decodeBencode(bencodedValue)
+		decoded, err := decoder.decodeBencode()
 		if err != nil {
 			fmt.Println(err)
 			return
