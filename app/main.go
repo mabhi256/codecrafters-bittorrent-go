@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +13,9 @@ import (
 type BencodeDecoder struct {
 	data []byte
 	pos  int
+
+	infoStart int
+	infoEnd   int
 }
 
 func NewBencodeDecoder(data []byte) *BencodeDecoder {
@@ -124,9 +128,17 @@ func (d *BencodeDecoder) decodeDictionary() (map[string]any, error) {
 			return nil, err
 		}
 
+		if key == "info" {
+			d.infoStart = d.pos
+		}
+
 		value, err := d.decodeBencode()
 		if err != nil {
 			return nil, err
+		}
+
+		if key == "info" {
+			d.infoEnd = d.pos
 		}
 
 		dict[key] = value
@@ -172,8 +184,13 @@ func main() {
 			return
 		}
 
+		info := decoded["info"].(map[string]any)
+		infoBytes := file[decoder.infoStart:decoder.infoEnd]
+		hash := sha1.Sum(infoBytes)
+
 		fmt.Println("Tracker URL:", decoded["announce"])
-		fmt.Println("Length:", decoded["info"].(map[string]any)["length"])
+		fmt.Println("Length:", info["length"])
+		fmt.Printf("Info Hash: %x\n", hash)
 
 	default:
 		fmt.Println("Unknown command: " + command)
