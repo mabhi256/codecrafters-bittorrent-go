@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
+
+const PEER_ID = "mabhi12345mabhi12345"
 
 type BencodeDecoder struct {
 	data []byte
@@ -208,7 +211,7 @@ func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
 	// Add query params
 	params := url.Values{}
 	params.Add("info_hash", string(t.InfoHash[:])) // This isn't the 40 byte hexadecimal
-	params.Add("peer_id", "mabhi12345mabhi12345")
+	params.Add("peer_id", PEER_ID)
 	params.Add("port", "6881")
 	params.Add("uploaded", "0")
 	params.Add("downloaded", "0")
@@ -255,6 +258,39 @@ func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
 	trackerResponse.Peers = peers
 
 	return trackerResponse, nil
+}
+
+func (t *TorrentFile) handShake(peer string) ([]byte, error) {
+	var handshake []byte
+	handshake = append(handshake, 19)
+	handshake = append(handshake, []byte("BitTorrent protocol")...)
+
+	reserved := make([]byte, 8)
+	handshake = append(handshake, reserved...)
+
+	handshake = append(handshake, t.InfoHash[:]...)
+	handshake = append(handshake, []byte(PEER_ID)...)
+
+	// Connect to peer on TCP
+	conn, err := net.Dial("tcp", peer)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	// Send handshake
+	_, err = conn.Write(handshake)
+	if err != nil {
+		return nil, err
+	}
+
+	response := make([]byte, len(handshake))
+	_, err = conn.Read(response)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	return response[len(handshake)-20 : len(handshake)], nil
 }
 
 func main() {
@@ -331,6 +367,31 @@ func main() {
 		for _, peer := range response.Peers {
 			fmt.Println(peer)
 		}
+
+	case "handshake":
+		fileName := os.Args[2]
+		peer := os.Args[3]
+
+		file, err := os.ReadFile(fileName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		decoder := NewBencodeDecoder(file)
+		torrent, err := decoder.decodeTorrent()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		peerID, err := torrent.handShake(peer)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		fmt.Printf("Peer ID: %x\n", peerID)
 
 	default:
 		fmt.Println("Unknown command: " + command)
