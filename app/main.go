@@ -191,6 +191,16 @@ func main() {
 		fmt.Println("Tracker URL:", decoded["announce"])
 		fmt.Println("Length:", info["length"])
 		fmt.Printf("Info Hash: %x\n", hash)
+		fmt.Println("Piece Length:", info["piece length"])
+
+		fmt.Println("Piece Hashes:")
+		pieces := info["pieces"].(string)
+		pieceBytes := []byte(pieces)
+		pieceIdx := 0
+		for pieceIdx < len(pieceBytes) {
+			fmt.Printf("%x\n", pieceBytes[pieceIdx:pieceIdx+20])
+			pieceIdx += 20
+		}
 
 	default:
 		fmt.Println("Unknown command: " + command)
