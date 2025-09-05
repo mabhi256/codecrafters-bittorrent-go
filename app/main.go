@@ -4,6 +4,9 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"unicode"
@@ -16,6 +19,27 @@ type BencodeDecoder struct {
 
 	infoStart int
 	infoEnd   int
+}
+
+type TorrentFile struct {
+	Announce string   `json:"announce"`
+	Info     InfoDict `json:"info"`
+	InfoHash [20]byte `json:"infoHash"`
+}
+
+type InfoDict struct {
+	Length      int    `json:"length"`
+	Name        string `json:"name"`
+	PieceLength int    `json:"piece length"`
+	Pieces      []byte `json:"pieces"`
+}
+
+type TrackerResponse struct {
+	Complete    int      `json:"complete"`
+	Incomplete  int      `json:"incomplete"`
+	Interval    int      `json:"interval"`
+	MinInterval int      `json:"min interval"`
+	Peers       []string `json:"peers"`
 }
 
 func NewBencodeDecoder(data []byte) *BencodeDecoder {
@@ -148,6 +172,91 @@ func (d *BencodeDecoder) decodeDictionary() (map[string]any, error) {
 	return dict, nil
 }
 
+func (d *BencodeDecoder) decodeTorrent() (*TorrentFile, error) {
+	dict, err := d.decodeDictionary()
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+
+	torrent := &TorrentFile{
+		Announce: dict["announce"].(string),
+	}
+
+	infoDict := dict["info"].(map[string]any)
+	torrent.Info = InfoDict{
+		Length:      infoDict["length"].(int),
+		Name:        infoDict["name"].(string),
+		PieceLength: infoDict["piece length"].(int),
+		Pieces:      []byte(infoDict["pieces"].(string)),
+	}
+
+	infoBytes := d.data[d.infoStart:d.infoEnd]
+	hash := sha1.Sum(infoBytes)
+	torrent.InfoHash = hash
+
+	return torrent, nil
+}
+
+func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
+	// Parse the announce URL
+	trackerUrl, err := url.Parse(t.Announce)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add query params
+	params := url.Values{}
+	params.Add("info_hash", string(t.InfoHash[:])) // This isn't the 40 byte hexadecimal
+	params.Add("peer_id", "mabhi12345mabhi12345")
+	params.Add("port", "6881")
+	params.Add("uploaded", "0")
+	params.Add("downloaded", "0")
+	params.Add("left", fmt.Sprintf("%d", t.Info.Length))
+	params.Add("compact", "1")
+
+	trackerUrl.RawQuery = params.Encode()
+
+	resp, err := http.Get(trackerUrl.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := NewBencodeDecoder(body)
+	decodedResp, err := decoder.decodeDictionary()
+	if err != nil {
+		return nil, err
+	}
+
+	trackerResponse := &TrackerResponse{
+		Complete:    decodedResp["complete"].(int),
+		Incomplete:  decodedResp["incomplete"].(int),
+		Interval:    decodedResp["interval"].(int),
+		MinInterval: decodedResp["min interval"].(int),
+	}
+
+	peersRaw := []byte(decodedResp["peers"].(string))
+
+	idx := 0
+	var peers []string
+	for idx < len(peersRaw) {
+		port := uint16(peersRaw[idx+4])<<8 | uint16(peersRaw[idx+5])
+		peer := fmt.Sprintf("%d.%d.%d.%d:%d",
+			peersRaw[idx], peersRaw[idx+1], peersRaw[idx+2], peersRaw[idx+3], port)
+		peers = append(peers, peer)
+		idx += 6
+	}
+	trackerResponse.Peers = peers
+
+	return trackerResponse, nil
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -169,37 +278,58 @@ func main() {
 		fmt.Println(string(jsonOutput))
 
 	case "info":
-		torrent := os.Args[2]
+		fileName := os.Args[2]
 
-		file, err := os.ReadFile(torrent)
+		file, err := os.ReadFile(fileName)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
 		decoder := NewBencodeDecoder(file)
-		decoded, err := decoder.decodeDictionary()
+		torrent, err := decoder.decodeTorrent()
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		info := decoded["info"].(map[string]any)
-		infoBytes := file[decoder.infoStart:decoder.infoEnd]
-		hash := sha1.Sum(infoBytes)
-
-		fmt.Println("Tracker URL:", decoded["announce"])
-		fmt.Println("Length:", info["length"])
-		fmt.Printf("Info Hash: %x\n", hash)
-		fmt.Println("Piece Length:", info["piece length"])
+		fmt.Println("Tracker URL:", torrent.Announce)
+		fmt.Println("Length:", torrent.Info.Length)
+		fmt.Printf("Info Hash: %x\n", torrent.InfoHash)
+		fmt.Println("Piece Length:", torrent.Info.PieceLength)
 
 		fmt.Println("Piece Hashes:")
-		pieces := info["pieces"].(string)
-		pieceBytes := []byte(pieces)
+		pieces := torrent.Info.Pieces
 		pieceIdx := 0
-		for pieceIdx < len(pieceBytes) {
-			fmt.Printf("%x\n", pieceBytes[pieceIdx:pieceIdx+20])
+		for pieceIdx < len(pieces) {
+			fmt.Printf("%x\n", pieces[pieceIdx:pieceIdx+20])
 			pieceIdx += 20
+		}
+
+	case "peers":
+		fileName := os.Args[2]
+
+		file, err := os.ReadFile(fileName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		decoder := NewBencodeDecoder(file)
+		torrent, err := decoder.decodeTorrent()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		response, err := torrent.trackerResponse()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		for _, peer := range response.Peers {
+			fmt.Println(peer)
 		}
 
 	default:
