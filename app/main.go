@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +44,12 @@ type TrackerResponse struct {
 	Interval    int      `json:"interval"`
 	MinInterval int      `json:"min interval"`
 	Peers       []string `json:"peers"`
+}
+
+type PeerMessage struct {
+	Length    uint32
+	MessageId uint8
+	Payload   []byte
 }
 
 func NewBencodeDecoder(data []byte) *BencodeDecoder {
@@ -260,7 +267,7 @@ func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
 	return trackerResponse, nil
 }
 
-func (t *TorrentFile) handShake(peer string) ([]byte, error) {
+func handShake(conn net.Conn, infoHash [20]byte) ([]byte, error) {
 	var handshake []byte
 	handshake = append(handshake, 19)
 	handshake = append(handshake, []byte("BitTorrent protocol")...)
@@ -268,18 +275,11 @@ func (t *TorrentFile) handShake(peer string) ([]byte, error) {
 	reserved := make([]byte, 8)
 	handshake = append(handshake, reserved...)
 
-	handshake = append(handshake, t.InfoHash[:]...)
+	handshake = append(handshake, infoHash[:]...)
 	handshake = append(handshake, []byte(PEER_ID)...)
 
-	// Connect to peer on TCP
-	conn, err := net.Dial("tcp", peer)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	// Send handshake
-	_, err = conn.Write(handshake)
+	_, err := conn.Write(handshake)
 	if err != nil {
 		return nil, err
 	}
@@ -291,6 +291,238 @@ func (t *TorrentFile) handShake(peer string) ([]byte, error) {
 	}
 
 	return response[len(handshake)-20 : len(handshake)], nil
+}
+
+func receiveMessage(conn net.Conn) (*PeerMessage, error) {
+	lengthBytes := make([]byte, 4)
+	_, err := io.ReadFull(conn, lengthBytes)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	length := binary.BigEndian.Uint32(lengthBytes)
+	response := make([]byte, length)
+	_, err = io.ReadFull(conn, response)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	messageId := response[0]
+	payload := response[1:]
+
+	peerMessage := &PeerMessage{
+		Length:    length,
+		MessageId: messageId,
+		Payload:   payload,
+	}
+
+	return peerMessage, nil
+}
+
+func sendMessage(conn net.Conn, message *PeerMessage) (int, error) {
+	var messageBytes []byte
+	lengthBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBytes, message.Length)
+	messageBytes = append(messageBytes, lengthBytes...)
+
+	messageBytes = append(messageBytes, message.MessageId)
+
+	messageBytes = append(messageBytes, message.Payload...)
+
+	n, err := conn.Write(messageBytes)
+	if err != nil {
+		return n, err
+	}
+
+	return n, nil
+}
+
+func ParseTorrent(fileName string) (*TorrentFile, error) {
+	file, err := os.ReadFile(fileName)
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := NewBencodeDecoder(file)
+	torrent, err := decoder.decodeTorrent()
+	if err != nil {
+		return nil, err
+	}
+
+	return torrent, nil
+}
+
+func downloadPiece(dest, fileName string, pieceIdx int) {
+	torrent, err := ParseTorrent(fileName)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	response, err := torrent.trackerResponse()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// 0. Establish a TCP connection with a peer
+	conn, err := net.Dial("tcp", response.Peers[1])
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer conn.Close()
+
+	// 1. Complete a 'BitTorrent protocol' handshake
+	_, err = handShake(conn, torrent.InfoHash)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// 2. Wait for a 'bitfield' message
+	bitfieldMessage, err := receiveMessage(conn)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	if bitfieldMessage.MessageId != 5 {
+		fmt.Println("Expecting a 'bitfield' message")
+		return
+	}
+
+	// 3. Send an 'interested' message
+	interestedMessage := &PeerMessage{
+		Length:    1,
+		MessageId: 2,
+		Payload:   []byte{},
+	}
+	_, err = sendMessage(conn, interestedMessage)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// 4. Wait for an 'unchoke' message
+	unchokeMessage, err := receiveMessage(conn)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	if unchokeMessage.MessageId != 1 {
+		fmt.Println("Expecting a 'unchoke' message")
+		return
+	}
+
+	// 5. Send a 'request' message
+	// torrent.Info.Pieces is the concatenated [20]byte SHA-1 hash of each piece
+	// should be the same as ceiling(fileLength/pieceLength)
+	numPieces := len(torrent.Info.Pieces) / 20
+
+	// Piece size when file size is not divisible by pieceLength
+	pieceSize := torrent.Info.PieceLength
+	if pieceIdx == numPieces-1 && torrent.Info.Length%torrent.Info.PieceLength != 0 {
+		pieceSize = torrent.Info.Length % torrent.Info.PieceLength
+	}
+
+	blockSize := 1 << 14                                 // 2^14, 16KB
+	numBlocks := (pieceSize + blockSize - 1) / blockSize // ceiling
+
+	// Request each block
+	for blockIdx := range numBlocks {
+		begin := blockIdx * blockSize
+		length := blockSize
+
+		// Handle last block of the last piece
+		if blockIdx == numBlocks-1 {
+			length = pieceSize - begin
+		}
+
+		payload := make([]byte, 12)
+		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceIdx))
+		binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+		binary.BigEndian.PutUint32(payload[8:12], uint32(length))
+
+		requestMessage := &PeerMessage{
+			Length:    13, // 1 byte message ID + 12 bytes payload
+			MessageId: 6,
+			Payload:   payload,
+		}
+		_, err = sendMessage(conn, requestMessage)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}
+
+	// 6. Create the file
+	file, err := os.Create(dest)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer file.Close()
+
+	// Pre-allocate the file to the desired size (fills with zeros)
+	err = file.Truncate(int64(pieceSize))
+	if err != nil {
+		fmt.Printf("Error truncating file: %v\n", err)
+		return
+	}
+
+	// 7. Wait for each 'piece' message
+	for range numBlocks {
+		pieceMessage, err := receiveMessage(conn)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		if pieceMessage.MessageId != 7 {
+			fmt.Println("Expecting a 'unchoke' message")
+			return
+		}
+
+		_ = binary.BigEndian.Uint32(pieceMessage.Payload[0:4]) // recvIdx
+		recvBegin := binary.BigEndian.Uint32(pieceMessage.Payload[4:8])
+		block := pieceMessage.Payload[8:]
+
+		_, err = file.Seek(int64(recvBegin), 0)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		_, err = file.Write(block)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}
+
+	fileContent, err := os.ReadFile(dest)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	recvHash := sha1.Sum(fileContent)
+	pieceHash := torrent.Info.Pieces[pieceIdx*20 : pieceIdx*20+20]
+
+	if recvHash != [20]byte(pieceHash) {
+		fmt.Printf("Expecting: %x,\nReceived: %x\n", pieceHash, recvHash)
+		fmt.Println("Available:")
+		pieces := torrent.Info.Pieces
+		idx := 0
+		for idx < len(pieces) {
+			fmt.Printf("%x\n", pieces[idx:idx+20])
+			idx += 20
+		}
+		return
+	} else {
+		fmt.Println("Downloaded and verified pieceIdx:", pieceIdx)
+	}
 }
 
 func main() {
@@ -315,15 +547,7 @@ func main() {
 
 	case "info":
 		fileName := os.Args[2]
-
-		file, err := os.ReadFile(fileName)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		decoder := NewBencodeDecoder(file)
-		torrent, err := decoder.decodeTorrent()
+		torrent, err := ParseTorrent(fileName)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -344,15 +568,7 @@ func main() {
 
 	case "peers":
 		fileName := os.Args[2]
-
-		file, err := os.ReadFile(fileName)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		decoder := NewBencodeDecoder(file)
-		torrent, err := decoder.decodeTorrent()
+		torrent, err := ParseTorrent(fileName)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -370,28 +586,39 @@ func main() {
 
 	case "handshake":
 		fileName := os.Args[2]
+		torrent, err := ParseTorrent(fileName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 		peer := os.Args[3]
 
-		file, err := os.ReadFile(fileName)
+		// Connect to peer on TCP
+		conn, err := net.Dial("tcp", peer)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
+		defer conn.Close()
 
-		decoder := NewBencodeDecoder(file)
-		torrent, err := decoder.decodeTorrent()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		peerID, err := torrent.handShake(peer)
+		peerID, err := handShake(conn, torrent.InfoHash)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
 		fmt.Printf("Peer ID: %x\n", peerID)
+
+	case "download_piece":
+		dest := os.Args[3]
+		fileName := os.Args[4]
+		pieceIdx, err := strconv.Atoi(os.Args[5])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		downloadPiece(dest, fileName, pieceIdx)
 
 	default:
 		fmt.Println("Unknown command: " + command)
