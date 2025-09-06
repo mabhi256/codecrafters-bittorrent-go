@@ -52,6 +52,12 @@ type PeerMessage struct {
 	Payload   []byte
 }
 
+type Result struct {
+	PieceIndex int
+	Data       []byte // nil if failed
+	Peer       string
+}
+
 func NewBencodeDecoder(data []byte) *BencodeDecoder {
 	return &BencodeDecoder{
 		data: data,
@@ -352,47 +358,30 @@ func ParseTorrent(fileName string) (*TorrentFile, error) {
 	return torrent, nil
 }
 
-func downloadPiece(dest, fileName string, pieceIdx int) {
-	torrent, err := ParseTorrent(fileName)
+func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
+	// Establish a TCP connection with a peer
+	conn, err := net.Dial("tcp", peer)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
-	response, err := torrent.trackerResponse()
+	// Complete a 'BitTorrent protocol' handshake
+	_, err = handShake(conn, t.InfoHash)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
-	// 0. Establish a TCP connection with a peer
-	conn, err := net.Dial("tcp", response.Peers[1])
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer conn.Close()
-
-	// 1. Complete a 'BitTorrent protocol' handshake
-	_, err = handShake(conn, torrent.InfoHash)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// 2. Wait for a 'bitfield' message
+	// Wait for a 'bitfield' message
 	bitfieldMessage, err := receiveMessage(conn)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
 	if bitfieldMessage.MessageId != 5 {
-		fmt.Println("Expecting a 'bitfield' message")
-		return
+		return nil, fmt.Errorf("expecting a 'bitfield' message")
 	}
 
-	// 3. Send an 'interested' message
+	// Send an 'interested' message
 	interestedMessage := &PeerMessage{
 		Length:    1,
 		MessageId: 2,
@@ -400,35 +389,39 @@ func downloadPiece(dest, fileName string, pieceIdx int) {
 	}
 	_, err = sendMessage(conn, interestedMessage)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
-	// 4. Wait for an 'unchoke' message
+	// Wait for an 'unchoke' message
 	unchokeMessage, err := receiveMessage(conn)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
 	if unchokeMessage.MessageId != 1 {
-		fmt.Println("Expecting a 'unchoke' message")
-		return
+		return nil, fmt.Errorf("expecting a 'unchoke' message")
 	}
 
-	// 5. Send a 'request' message
+	return conn, nil
+}
+
+func (t *TorrentFile) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error) {
+
+	// Send a 'request' message
 	// torrent.Info.Pieces is the concatenated [20]byte SHA-1 hash of each piece
 	// should be the same as ceiling(fileLength/pieceLength)
-	numPieces := len(torrent.Info.Pieces) / 20
+	numPieces := len(t.Info.Pieces) / 20
 
 	// Piece size when file size is not divisible by pieceLength
-	pieceSize := torrent.Info.PieceLength
-	if pieceIdx == numPieces-1 && torrent.Info.Length%torrent.Info.PieceLength != 0 {
-		pieceSize = torrent.Info.Length % torrent.Info.PieceLength
+	pieceSize := t.Info.PieceLength
+	if pieceIdx == numPieces-1 && t.Info.Length%t.Info.PieceLength != 0 {
+		pieceSize = t.Info.Length % t.Info.PieceLength
 	}
 
 	blockSize := 1 << 14                                 // 2^14, 16KB
 	numBlocks := (pieceSize + blockSize - 1) / blockSize // ceiling
+
+	pieceBytes := make([]byte, pieceSize)
 
 	// Request each block
 	for blockIdx := range numBlocks {
@@ -450,78 +443,85 @@ func downloadPiece(dest, fileName string, pieceIdx int) {
 			MessageId: 6,
 			Payload:   payload,
 		}
-		_, err = sendMessage(conn, requestMessage)
+		_, err := sendMessage(conn, requestMessage)
 		if err != nil {
-			fmt.Println(err)
-			return
+			return nil, err
 		}
 	}
 
-	// 6. Create the file
-	file, err := os.Create(dest)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer file.Close()
-
-	// Pre-allocate the file to the desired size (fills with zeros)
-	err = file.Truncate(int64(pieceSize))
-	if err != nil {
-		fmt.Printf("Error truncating file: %v\n", err)
-		return
-	}
-
-	// 7. Wait for each 'piece' message
+	// Wait for each 'piece' message
 	for range numBlocks {
 		pieceMessage, err := receiveMessage(conn)
 		if err != nil {
-			fmt.Println(err)
-			return
+			return nil, err
 		}
 
 		if pieceMessage.MessageId != 7 {
-			fmt.Println("Expecting a 'unchoke' message")
-			return
+			return nil, fmt.Errorf("expecting a 'unchoke' message")
 		}
 
 		_ = binary.BigEndian.Uint32(pieceMessage.Payload[0:4]) // recvIdx
 		recvBegin := binary.BigEndian.Uint32(pieceMessage.Payload[4:8])
 		block := pieceMessage.Payload[8:]
 
-		_, err = file.Seek(int64(recvBegin), 0)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		_, err = file.Write(block)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
+		copy(pieceBytes[recvBegin:], block)
 	}
 
-	fileContent, err := os.ReadFile(dest)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	recvHash := sha1.Sum(fileContent)
-	pieceHash := torrent.Info.Pieces[pieceIdx*20 : pieceIdx*20+20]
-
+	// Verify the downloaded piece
+	recvHash := sha1.Sum(pieceBytes)
+	pieceHash := t.Info.Pieces[pieceIdx*20 : pieceIdx*20+20]
 	if recvHash != [20]byte(pieceHash) {
-		fmt.Printf("Expecting: %x,\nReceived: %x\n", pieceHash, recvHash)
-		fmt.Println("Available:")
-		pieces := torrent.Info.Pieces
-		idx := 0
-		for idx < len(pieces) {
-			fmt.Printf("%x\n", pieces[idx:idx+20])
-			idx += 20
+		return nil, fmt.Errorf("expecting: %x,Received: %x", pieceHash, recvHash)
+	}
+
+	return pieceBytes, nil
+}
+
+func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan chan<- Result) {
+	conns := make(map[string]net.Conn)
+	for pieceIdx := range jobQueue {
+		// Try to get ONE peer
+		peer := <-peerChan // This blocks until peer available
+
+		conn, exists := conns[peer]
+		if !exists {
+			var err error
+			conn, err = t.connectPeer(peer)
+			if err != nil {
+				fmt.Printf("Failed to connect to peer %s: %v\n", peer, err)
+				peerChan <- peer     // Return peer to pool
+				jobQueue <- pieceIdx // Return job to queue
+				continue
+			}
+			conns[peer] = conn
 		}
-		return
-	} else {
-		fmt.Println("Downloaded and verified pieceIdx:", pieceIdx)
+
+		pieceBytes, err := t.downloadPiece(conn, pieceIdx)
+		if err != nil {
+			// Close and remove bad connection
+			conn.Close()
+			delete(conns, peer)
+
+			// FAILED: return peer & job back to their channel
+			peerChan <- peer
+			jobQueue <- pieceIdx
+			continue
+		}
+
+		result := Result{
+			PieceIndex: pieceIdx,
+			Data:       pieceBytes,
+			Peer:       peer,
+		}
+
+		// SUCCESS: send result, put peer back
+		resultChan <- result
+		peerChan <- peer
+	}
+
+	// Cleanup connections when worker exits
+	for _, conn := range conns {
+		conn.Close()
 	}
 }
 
@@ -618,7 +618,105 @@ func main() {
 			return
 		}
 
-		downloadPiece(dest, fileName, pieceIdx)
+		torrent, err := ParseTorrent(fileName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		response, err := torrent.trackerResponse()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		conn, err := torrent.connectPeer(response.Peers[0])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer conn.Close()
+
+		pieceBytes, err := torrent.downloadPiece(conn, pieceIdx)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Create the file
+		file, err := os.Create(dest)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(pieceBytes)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		fmt.Println("Downloaded and verified pieceIdx:", pieceIdx)
+
+	case "download":
+		dest := os.Args[3]
+		fileName := os.Args[4]
+
+		torrent, err := ParseTorrent(fileName)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		response, err := torrent.trackerResponse()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Create job queue
+		numPieces := len(torrent.Info.Pieces) / 20
+		jobQueue := make(chan int, numPieces)
+		for i := range numPieces {
+			jobQueue <- i
+		}
+
+		// Create result channel to receive downloaded pieces
+		resultChan := make(chan Result, numPieces)
+
+		// Peer pool
+		peerChan := make(chan string, len(response.Peers))
+		for _, peer := range response.Peers {
+			peerChan <- peer
+		}
+
+		// Start workers which assign the next piece to the next available peer
+		numWorkers := min(5, len(response.Peers))
+		for range numWorkers {
+			go torrent.worker(jobQueue, peerChan, resultChan)
+		}
+
+		file, err := os.Create(dest)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer file.Close()
+
+		for a := 1; a <= numPieces; a++ {
+			result := <-resultChan
+
+			file.Seek(int64(result.PieceIndex)*int64(torrent.Info.PieceLength), 0)
+
+			_, err = file.Write(result.Data)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+		}
+
+		fmt.Println("Downloaded and verified file")
 
 	default:
 		fmt.Println("Unknown command: " + command)
