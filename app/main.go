@@ -720,12 +720,22 @@ func main() {
 
 		// Extension handshake with peer (if enabled)
 		if isPeerExtEnabled {
-			_, err := extHandShake(conn)
+			encodedResp, err := extHandShake(conn)
 			if err != nil {
 				fmt.Println(err)
 				return
 			}
-			// fmt.Printf("%s\n", string(response.Payload))
+
+			// skip the handshake extension message id 0
+			decoder := NewBencodeDecoder(encodedResp.Payload[1:])
+			resp, err := decoder.decodeDictionary()
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+
+			peerMetadataExtId := resp["m"].(map[string]any)["ut_metadata"]
+			fmt.Println("Peer Metadata Extension ID:", peerMetadataExtId)
 		}
 
 		fmt.Printf("Peer ID: %x\n", peerID)

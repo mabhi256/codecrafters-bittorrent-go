@@ -36,7 +36,7 @@ func (d *BencodeDecoder) decodeBencode() (any, error) {
 		return d.decodeDictionary()
 
 	default:
-		return "", fmt.Errorf("format not supported")
+		return "", fmt.Errorf("format not supported: %v", d.data[d.pos])
 
 	}
 }
