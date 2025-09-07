@@ -13,19 +13,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
 
 const PEER_ID = "mabhi12345mabhi12345"
-
-type BencodeDecoder struct {
-	data []byte
-	pos  int
-
-	infoStart int
-	infoEnd   int
-}
 
 type TorrentFile struct {
 	Announce string   `json:"announce"`
@@ -64,136 +55,6 @@ type Magnet struct {
 	TrackerUrl string   `json:"tracker_url"`
 	InfoHash   [20]byte `json:"info_hash"`
 	Name       string   `json:"name,omitempty"` // from "dn" parameter if present
-}
-
-func NewBencodeDecoder(data []byte) *BencodeDecoder {
-	return &BencodeDecoder{
-		data: data,
-		pos:  0,
-	}
-}
-
-func (d *BencodeDecoder) decodeBencode() (any, error) {
-	switch {
-	case unicode.IsDigit(rune(d.data[d.pos])):
-		return d.decodeString()
-
-	case d.data[d.pos] == 'i':
-		return d.decodeInteger()
-
-	case d.data[d.pos] == 'l':
-		return d.decodeList()
-
-	case d.data[d.pos] == 'd':
-		return d.decodeDictionary()
-
-	default:
-		return "", fmt.Errorf("format not supported")
-
-	}
-}
-
-func (d *BencodeDecoder) decodeString() (string, error) {
-	start := d.pos
-
-	for d.pos < len(d.data) {
-		if d.data[d.pos] == ':' {
-			break
-		}
-		d.pos++
-	}
-
-	lengthStr := string(d.data[start:d.pos])
-
-	length, err := strconv.Atoi(lengthStr)
-	if err != nil {
-		return "", err
-	}
-
-	d.pos++
-	value := d.data[d.pos : d.pos+length]
-	d.pos += length
-
-	return string(value), nil
-}
-
-func (d *BencodeDecoder) decodeInteger() (int, error) {
-	d.pos++ // move pos beyond the beginning delimiter
-
-	sign := 1
-	if string(d.data[d.pos]) == "-" {
-		sign = -1
-		d.pos++
-	}
-
-	var valueStr string
-
-	for d.pos < len(d.data) && string(d.data[d.pos]) != "e" {
-		valueStr += string(d.data[d.pos])
-		d.pos++
-	}
-
-	if valueStr == "-0" {
-		return 0, fmt.Errorf("invalid integer encoding: i-0e")
-	}
-
-	if valueStr[0] == '0' && len(valueStr) != 1 {
-		return 0, fmt.Errorf("invalid integer encoding: %s", d.data)
-	}
-
-	value, err := strconv.Atoi(valueStr)
-	if err != nil {
-		return 0, err
-	}
-	d.pos++
-
-	return sign * value, nil
-}
-
-func (d *BencodeDecoder) decodeList() ([]any, error) {
-	d.pos++
-
-	list := []any{}
-	for d.pos < len(d.data) && d.data[d.pos] != 'e' {
-		item, err := d.decodeBencode()
-		if err != nil {
-			return nil, err
-		}
-		list = append(list, item)
-	}
-
-	d.pos++
-	return list, nil
-}
-
-func (d *BencodeDecoder) decodeDictionary() (map[string]any, error) {
-	d.pos++
-
-	dict := make(map[string]any)
-	for d.pos < len(d.data) && d.data[d.pos] != 'e' {
-		key, err := d.decodeString()
-		if err != nil {
-			return nil, err
-		}
-
-		if key == "info" {
-			d.infoStart = d.pos
-		}
-
-		value, err := d.decodeBencode()
-		if err != nil {
-			return nil, err
-		}
-
-		if key == "info" {
-			d.infoEnd = d.pos
-		}
-
-		dict[key] = value
-	}
-
-	d.pos++
-	return dict, nil
 }
 
 func (d *BencodeDecoder) decodeTorrent() (*TorrentFile, error) {
@@ -285,13 +146,13 @@ func announceRequest(trackerUrl string, infoHash [20]byte, length int) (*Announc
 	return trackerResponse, nil
 }
 
-func handShake(conn net.Conn, infoHash [20]byte, isExtended bool) ([]byte, error) {
+func handShake(conn net.Conn, infoHash [20]byte, isExtEnabled bool) ([]byte, bool, error) {
 	var handshake []byte
 	handshake = append(handshake, 19)
 	handshake = append(handshake, []byte("BitTorrent protocol")...)
 
 	reserved := make([]byte, 8)
-	if isExtended {
+	if isExtEnabled {
 		reserved[5] = 0x10 // ... 0001_0000 0000_0000 0000_0000
 	}
 	handshake = append(handshake, reserved...)
@@ -302,16 +163,19 @@ func handShake(conn net.Conn, infoHash [20]byte, isExtended bool) ([]byte, error
 	// Send handshake
 	_, err := conn.Write(handshake)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	response := make([]byte, len(handshake))
 	_, err = conn.Read(response)
 	if err != nil && err != io.EOF {
-		return nil, err
+		return nil, false, err
 	}
 
-	return response[len(handshake)-20 : len(handshake)], nil
+	peerReservedBytes := response[20:28]
+	isPeerExtEnabled := peerReservedBytes[5]&0x10 != 0
+
+	return response[len(handshake)-20 : len(handshake)], isPeerExtEnabled, nil
 }
 
 func receiveMessage(conn net.Conn) (*PeerMessage, error) {
@@ -381,7 +245,7 @@ func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
 	}
 
 	// Complete a 'BitTorrent protocol' handshake
-	_, err = handShake(conn, t.InfoHash, false)
+	_, _, err = handShake(conn, t.InfoHash, false)
 	if err != nil {
 		return nil, err
 	}
@@ -578,6 +442,38 @@ func (m *Magnet) announceMagnet() (*AnnounceResponse, error) {
 	return announceRequest(m.TrackerUrl, m.InfoHash, 10)
 }
 
+func extHandShake(conn net.Conn) (*PeerMessage, error) {
+	encoder := NewBencodeEncoder()
+
+	extCodes := map[string]any{"ut_metadata": 10, "ut_pex": 22}
+	extMsg := map[string]any{"m": extCodes}
+	err := encoder.encodeDict(extMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	payload := []byte{0} // extension message id 0
+	payload = append(payload, encoder.data...)
+
+	message := &PeerMessage{
+		Length:    uint32(len(payload) + 1),
+		MessageId: 20, // Extension Message ID
+		Payload:   payload,
+	}
+
+	_, err = sendMessage(conn, message)
+	if err != nil {
+		return nil, err
+	}
+
+	recvExtMessage, err := receiveMessage(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	return recvExtMessage, nil
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -654,7 +550,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		peerID, err := handShake(conn, torrent.InfoHash, false)
+		peerID, _, err := handShake(conn, torrent.InfoHash, false)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -803,10 +699,33 @@ func main() {
 			return
 		}
 
-		peerID, err := handShake(conn, magnet.InfoHash, true)
+		// Base handshake with peer
+		peerID, isPeerExtEnabled, err := handShake(conn, magnet.InfoHash, true)
 		if err != nil {
 			fmt.Println(err)
 			return
+		}
+
+		// No need to send 'bitfield' message to peer for this challenge
+		// Wait for a 'bitfield' message
+		bitfieldMessage, err := receiveMessage(conn)
+		if err != nil {
+			return
+		}
+
+		if bitfieldMessage.MessageId != 5 {
+			fmt.Println("expecting a 'bitfield' message")
+			return
+		}
+
+		// Extension handshake with peer (if enabled)
+		if isPeerExtEnabled {
+			_, err := extHandShake(conn)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			// fmt.Printf("%s\n", string(response.Payload))
 		}
 
 		fmt.Printf("Peer ID: %x\n", peerID)
