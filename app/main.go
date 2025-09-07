@@ -529,13 +529,13 @@ func extHandShake(conn net.Conn) (*PeerMessage, error) {
 	return recvExtMessage, nil
 }
 
-func requestMetadata(conn net.Conn, extId int) (map[string]any, error) {
+func requestMetadata(conn net.Conn, extId int) (map[string]any, map[string]any, error) {
 	encoder := NewBencodeEncoder()
 
 	reqMsg := map[string]any{"msg_type": 0, "piece": 0}
 	err := encoder.encodeDict(reqMsg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	payload := []byte{byte(extId)}
@@ -543,16 +543,21 @@ func requestMetadata(conn net.Conn, extId int) (map[string]any, error) {
 
 	metadataMsg, err := sendExtensionMsg(conn, payload)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	decoder := NewBencodeDecoder(metadataMsg.Payload[1:])
-	response, err := decoder.decodeDictionary()
+	metadataResp, err := decoder.decodeDictionary()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return response, nil
+	metadataPieceResp, err := decoder.decodeDictionary()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return metadataResp, metadataPieceResp, nil
 }
 
 func main() {
@@ -802,13 +807,23 @@ func main() {
 			return
 		}
 
-		metadataResp, err := requestMetadata(conn, extId)
+		_, pieceResp, err := requestMetadata(conn, extId)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		fmt.Println(metadataResp)
+		fmt.Println("Tracker URL:", magnet.TrackerUrl)
+		fmt.Println("Length:", pieceResp["length"])
+		fmt.Printf("Info Hash: %x\n", magnet.InfoHash)
+		fmt.Println("Piece Length:", pieceResp["piece length"])
+		fmt.Println("Piece Hashes:")
+		idx := 0
+		piecesBytes := []byte(pieceResp["pieces"].(string))
+		for idx < len(piecesBytes) {
+			fmt.Printf("%x\n", piecesBytes[idx:idx+20])
+			idx += 20
+		}
 
 	default:
 		fmt.Println("Unknown command: " + command)
