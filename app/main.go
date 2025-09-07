@@ -18,6 +18,19 @@ import (
 
 const PEER_ID = "mabhi12345mabhi12345"
 
+const (
+	MSG_CHOKE          = 0
+	MSG_UNCHOKE        = 1
+	MSG_INTERESTED     = 2
+	MSG_NOT_INTERESTED = 3
+	MSG_HAVE           = 4
+	MSG_BITFIELD       = 5
+	MSG_REQUEST        = 6
+	MSG_PIECE          = 7
+	MSG_CANCEL         = 8
+	MSG_EXTENSION      = 20
+)
+
 type TorrentFile struct {
 	Announce string   `json:"announce"`
 	Info     InfoDict `json:"info"`
@@ -56,6 +69,8 @@ type Magnet struct {
 	InfoHash   [20]byte `json:"info_hash"`
 	Name       string   `json:"name,omitempty"` // from "dn" parameter if present
 }
+
+type PeerConnector func(peer string) (net.Conn, error)
 
 func (d *BencodeDecoder) decodeTorrent() (*TorrentFile, error) {
 	dict, err := d.decodeDictionary()
@@ -186,6 +201,16 @@ func receiveMessage(conn net.Conn) (*PeerMessage, error) {
 	}
 
 	length := binary.BigEndian.Uint32(lengthBytes)
+
+	// Handle keep-alive message (length 0)
+	if length == 0 {
+		return &PeerMessage{
+			Length:    0,
+			MessageId: 0, // Keep-alive doesn't have a message ID
+			Payload:   []byte{},
+		}, nil
+	}
+
 	response := make([]byte, length)
 	_, err = io.ReadFull(conn, response)
 	if err != nil && err != io.EOF {
@@ -338,7 +363,7 @@ func (p *InfoDict) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error) {
 		}
 
 		if pieceMessage.MessageId != 7 {
-			return nil, fmt.Errorf("expecting a 'unchoke' message")
+			return nil, fmt.Errorf("expecting a 'piece' message")
 		}
 
 		recvIdx := binary.BigEndian.Uint32(pieceMessage.Payload[0:4]) // recvIdx
@@ -360,7 +385,7 @@ func (p *InfoDict) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error) {
 	return pieceBytes, nil
 }
 
-func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan chan<- Result) {
+func worker(info *InfoDict, connectPeer PeerConnector, jobQueue chan int, peerChan chan string, resultChan chan<- Result) {
 	conns := make(map[string]net.Conn)
 	for pieceIdx := range jobQueue {
 		// Try to get ONE peer
@@ -369,7 +394,7 @@ func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan
 		conn, exists := conns[peer]
 		if !exists {
 			var err error
-			conn, err = t.connectPeer(peer)
+			conn, err = connectPeer(peer)
 			if err != nil {
 				fmt.Printf("Failed to connect to peer %s: %v\n", peer, err)
 				peerChan <- peer     // Return peer to pool
@@ -379,8 +404,9 @@ func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan
 			conns[peer] = conn
 		}
 
-		pieceBytes, err := t.Info.downloadPiece(conn, pieceIdx)
+		pieceBytes, err := info.downloadPiece(conn, pieceIdx)
 		if err != nil {
+			fmt.Printf("Failed to download piece-%d from peer %s: %v\n", pieceIdx, peer, err)
 			// Close and remove bad connection
 			conn.Close()
 			delete(conns, peer)
@@ -406,6 +432,53 @@ func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan
 	for _, conn := range conns {
 		conn.Close()
 	}
+}
+
+func downloadFile(dest string, info *InfoDict,
+	connectPeer PeerConnector, peers []string) error {
+
+	// Create job queue - Don't close since we put failed jobs back to the queue
+	numPieces := len(info.Pieces) / 20
+	jobQueue := make(chan int, numPieces)
+	for i := range numPieces {
+		jobQueue <- i
+	}
+
+	// Create result channel to receive downloaded pieces
+	resultChan := make(chan Result, numPieces)
+
+	// Peer pool
+	peerChan := make(chan string, len(peers))
+	for _, peer := range peers {
+		peerChan <- peer
+	}
+
+	// Start workers which assign the next piece to the next available peer
+	numWorkers := min(5, len(peers))
+	for range numWorkers {
+		go worker(info, connectPeer, jobQueue, peerChan, resultChan)
+	}
+
+	file, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	for a := 1; a <= numPieces; a++ {
+		result := <-resultChan
+
+		file.Seek(int64(result.PieceIndex)*int64(info.PieceLength), 0)
+
+		_, err = file.Write(result.Data)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("Downloaded and verified file")
+
+	return nil
 }
 
 func ParseMagnet(magnetLink string) (*Magnet, error) {
@@ -496,7 +569,7 @@ func (m *Magnet) extensionHandshake(peer string) (net.Conn, string, int, error) 
 	}
 
 	if bitfieldMessage.MessageId != 5 {
-		return nil, "", 0, fmt.Errorf("expecting a 'bitfield' message")
+		return nil, "", 0, fmt.Errorf("expecting a 'bitfield' message: %v", bitfieldMessage)
 	}
 
 	extId := 0
@@ -750,48 +823,16 @@ func main() {
 			return
 		}
 
-		// Create job queue - Don't close since we put failed jobs back to the queue
-		numPieces := len(torrent.Info.Pieces) / 20
-		jobQueue := make(chan int, numPieces)
-		for i := range numPieces {
-			jobQueue <- i
+		// create connector for torrent
+		connectPeer := func(peer string) (net.Conn, error) {
+			return torrent.connectPeer(peer)
 		}
 
-		// Create result channel to receive downloaded pieces
-		resultChan := make(chan Result, numPieces)
-
-		// Peer pool
-		peerChan := make(chan string, len(response.Peers))
-		for _, peer := range response.Peers {
-			peerChan <- peer
-		}
-
-		// Start workers which assign the next piece to the next available peer
-		numWorkers := min(5, len(response.Peers))
-		for range numWorkers {
-			go torrent.worker(jobQueue, peerChan, resultChan)
-		}
-
-		file, err := os.Create(dest)
+		err = downloadFile(dest, &torrent.Info, connectPeer, response.Peers)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
-		defer file.Close()
-
-		for a := 1; a <= numPieces; a++ {
-			result := <-resultChan
-
-			file.Seek(int64(result.PieceIndex)*int64(torrent.Info.PieceLength), 0)
-
-			_, err = file.Write(result.Data)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-		}
-
-		fmt.Println("Downloaded and verified file")
 
 	case "magnet_parse":
 		magnetLink := os.Args[2]
@@ -919,6 +960,46 @@ func main() {
 		}
 
 		fmt.Println("Downloaded and verified pieceIdx:", pieceIdx)
+
+	case "magnet_download":
+		dest := os.Args[3]
+		magnetLink := os.Args[4]
+
+		magnet, err := ParseMagnet(magnetLink)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		announceResponse, err := magnet.announceMagnet()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		conn, _, extId, err := magnet.connectPeer(announceResponse.Peers[0])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		pieceInfo, err := requestMetadata(conn, extId)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// create connector for torrent
+		connectPeer := func(peer string) (net.Conn, error) {
+			conn, _, _, err := magnet.connectPeer(peer)
+			return conn, err
+		}
+
+		err = downloadFile(dest, pieceInfo, connectPeer, announceResponse.Peers)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 
 	default:
 		fmt.Println("Unknown command: " + command)
