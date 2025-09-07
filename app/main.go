@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,7 +40,7 @@ type InfoDict struct {
 	Pieces      []byte `json:"pieces"`
 }
 
-type TrackerResponse struct {
+type AnnounceResponse struct {
 	Complete    int      `json:"complete"`
 	Incomplete  int      `json:"incomplete"`
 	Interval    int      `json:"interval"`
@@ -57,6 +58,12 @@ type Result struct {
 	PieceIndex int
 	Data       []byte // nil if failed
 	Peer       string
+}
+
+type Magnet struct {
+	TrackerUrl string   `json:"tracker_url"`
+	InfoHash   [20]byte `json:"info_hash"`
+	Name       string   `json:"name,omitempty"` // from "dn" parameter if present
 }
 
 func NewBencodeDecoder(data []byte) *BencodeDecoder {
@@ -215,26 +222,30 @@ func (d *BencodeDecoder) decodeTorrent() (*TorrentFile, error) {
 	return torrent, nil
 }
 
-func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
+func (t *TorrentFile) announceTorrent() (*AnnounceResponse, error) {
+	return announceRequest(t.Announce, t.InfoHash, t.Info.Length)
+}
+
+func announceRequest(trackerUrl string, infoHash [20]byte, length int) (*AnnounceResponse, error) {
 	// Parse the announce URL
-	trackerUrl, err := url.Parse(t.Announce)
+	tu, err := url.Parse(trackerUrl)
 	if err != nil {
 		return nil, err
 	}
 
 	// Add query params
 	params := url.Values{}
-	params.Add("info_hash", string(t.InfoHash[:])) // This isn't the 40 byte hexadecimal
+	params.Add("info_hash", string(infoHash[:])) // This isn't the 40 byte hexadecimal
 	params.Add("peer_id", PEER_ID)
 	params.Add("port", "6881")
 	params.Add("uploaded", "0")
 	params.Add("downloaded", "0")
-	params.Add("left", fmt.Sprintf("%d", t.Info.Length))
+	params.Add("left", fmt.Sprintf("%d", length))
 	params.Add("compact", "1")
 
-	trackerUrl.RawQuery = params.Encode()
+	tu.RawQuery = params.Encode()
 
-	resp, err := http.Get(trackerUrl.String())
+	resp, err := http.Get(tu.String())
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +262,7 @@ func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
 		return nil, err
 	}
 
-	trackerResponse := &TrackerResponse{
+	trackerResponse := &AnnounceResponse{
 		Complete:    decodedResp["complete"].(int),
 		Incomplete:  decodedResp["incomplete"].(int),
 		Interval:    decodedResp["interval"].(int),
@@ -274,12 +285,15 @@ func (t *TorrentFile) trackerResponse() (*TrackerResponse, error) {
 	return trackerResponse, nil
 }
 
-func handShake(conn net.Conn, infoHash [20]byte) ([]byte, error) {
+func handShake(conn net.Conn, infoHash [20]byte, isExtended bool) ([]byte, error) {
 	var handshake []byte
 	handshake = append(handshake, 19)
 	handshake = append(handshake, []byte("BitTorrent protocol")...)
 
 	reserved := make([]byte, 8)
+	if isExtended {
+		reserved[5] = 0x10 // ... 0001_0000 0000_0000 0000_0000
+	}
 	handshake = append(handshake, reserved...)
 
 	handshake = append(handshake, infoHash[:]...)
@@ -367,7 +381,7 @@ func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
 	}
 
 	// Complete a 'BitTorrent protocol' handshake
-	_, err = handShake(conn, t.InfoHash)
+	_, err = handShake(conn, t.InfoHash, false)
 	if err != nil {
 		return nil, err
 	}
@@ -526,6 +540,44 @@ func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan
 	}
 }
 
+func ParseMagnet(magnetLink string) (*Magnet, error) {
+	ml, err := url.Parse(magnetLink)
+	if err != nil {
+		return nil, fmt.Errorf("invalid magnet link: %w", err)
+	}
+	params := ml.Query()
+
+	xt := params.Get("xt")
+	if !strings.HasPrefix(xt, "urn:btih:") {
+		return nil, fmt.Errorf("invalid xt param")
+	}
+
+	trackerURL := params.Get("tr")
+	name := params.Get("dn")
+
+	infoHashHex := strings.TrimPrefix(xt, "urn:btih:")
+	infoHashBytes, err := hex.DecodeString(infoHashHex)
+	if err != nil {
+		return nil, err
+	}
+	var infoHash [20]byte
+	copy(infoHash[:], infoHashBytes)
+
+	magnet := &Magnet{
+		TrackerUrl: trackerURL,
+		InfoHash:   infoHash,
+		Name:       name,
+	}
+
+	return magnet, nil
+}
+
+func (m *Magnet) announceMagnet() (*AnnounceResponse, error) {
+	// just use some non-zero value for length,
+	// this will make the server think that you still have stuff to download
+	return announceRequest(m.TrackerUrl, m.InfoHash, 10)
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -575,7 +627,7 @@ func main() {
 			return
 		}
 
-		response, err := torrent.trackerResponse()
+		response, err := torrent.announceTorrent()
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -602,7 +654,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		peerID, err := handShake(conn, torrent.InfoHash)
+		peerID, err := handShake(conn, torrent.InfoHash, false)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -625,7 +677,7 @@ func main() {
 			return
 		}
 
-		response, err := torrent.trackerResponse()
+		response, err := torrent.announceTorrent()
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -670,7 +722,7 @@ func main() {
 			return
 		}
 
-		response, err := torrent.trackerResponse()
+		response, err := torrent.announceTorrent()
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -721,25 +773,43 @@ func main() {
 
 	case "magnet_parse":
 		magnetLink := os.Args[2]
-
-		ml, err := url.Parse(magnetLink)
+		magnet, err := ParseMagnet(magnetLink)
 		if err != nil {
-			fmt.Println("Invalid magnet link:", err)
+			fmt.Println(err)
 			return
 		}
-		params := ml.Query()
 
-		xt := params.Get("xt")
-		if !strings.HasPrefix(xt, "urn:btih:") {
-			fmt.Println("Invalid xt param:", err)
+		fmt.Printf("Info Hash: %x\n", magnet.InfoHash)
+		fmt.Println("Tracker URL:", magnet.TrackerUrl)
+
+	case "magnet_handshake":
+		magnetLink := os.Args[2]
+		magnet, err := ParseMagnet(magnetLink)
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
-		infoHash := strings.TrimPrefix(xt, "urn:btih:")
 
-		trackerURL := params.Get("tr")
+		announceResponse, err := magnet.announceMagnet()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 
-		fmt.Println("Info Hash:", infoHash)
-		fmt.Println("Tracker URL:", trackerURL)
+		// Establish a TCP connection with a peer
+		conn, err := net.Dial("tcp", announceResponse.Peers[0])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		peerID, err := handShake(conn, magnet.InfoHash, true)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		fmt.Printf("Peer ID: %x\n", peerID)
 
 	default:
 		fmt.Println("Unknown command: " + command)
