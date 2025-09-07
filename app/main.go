@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
@@ -675,7 +676,7 @@ func main() {
 			return
 		}
 
-		// Create job queue
+		// Create job queue - Don't close since we put failed jobs back to the queue
 		numPieces := len(torrent.Info.Pieces) / 20
 		jobQueue := make(chan int, numPieces)
 		for i := range numPieces {
@@ -717,6 +718,28 @@ func main() {
 		}
 
 		fmt.Println("Downloaded and verified file")
+
+	case "magnet_parse":
+		magnetLink := os.Args[2]
+
+		ml, err := url.Parse(magnetLink)
+		if err != nil {
+			fmt.Println("Invalid magnet link:", err)
+			return
+		}
+		params := ml.Query()
+
+		xt := params.Get("xt")
+		if !strings.HasPrefix(xt, "urn:btih:") {
+			fmt.Println("Invalid xt param:", err)
+			return
+		}
+		infoHash := strings.TrimPrefix(xt, "urn:btih:")
+
+		trackerURL := params.Get("tr")
+
+		fmt.Println("Info Hash:", infoHash)
+		fmt.Println("Tracker URL:", trackerURL)
 
 	default:
 		fmt.Println("Unknown command: " + command)
