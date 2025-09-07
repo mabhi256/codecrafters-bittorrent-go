@@ -146,13 +146,13 @@ func announceRequest(trackerUrl string, infoHash [20]byte, length int) (*Announc
 	return trackerResponse, nil
 }
 
-func handShake(conn net.Conn, infoHash [20]byte, isExtEnabled bool) ([]byte, bool, error) {
+func handShake(conn net.Conn, infoHash [20]byte, useExtensions bool) ([]byte, bool, error) {
 	var handshake []byte
 	handshake = append(handshake, 19)
 	handshake = append(handshake, []byte("BitTorrent protocol")...)
 
 	reserved := make([]byte, 8)
-	if isExtEnabled {
+	if useExtensions {
 		reserved[5] = 0x10 // ... 0001_0000 0000_0000 0000_0000
 	}
 	handshake = append(handshake, reserved...)
@@ -244,7 +244,7 @@ func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
 		return nil, err
 	}
 
-	// Complete a 'BitTorrent protocol' handshake
+	// Base handshake with peer
 	_, _, err = handShake(conn, t.InfoHash, false)
 	if err != nil {
 		return nil, err
@@ -255,7 +255,6 @@ func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if bitfieldMessage.MessageId != 5 {
 		return nil, fmt.Errorf("expecting a 'bitfield' message")
 	}
@@ -276,29 +275,30 @@ func (t *TorrentFile) connectPeer(peer string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if unchokeMessage.MessageId != 1 {
 		return nil, fmt.Errorf("expecting a 'unchoke' message")
 	}
 
-	return conn, nil
+	return conn, err
 }
 
-func (t *TorrentFile) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error) {
+func (p *InfoDict) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error) {
 
 	// Send a 'request' message
 	// torrent.Info.Pieces is the concatenated [20]byte SHA-1 hash of each piece
 	// should be the same as ceiling(fileLength/pieceLength)
-	numPieces := len(t.Info.Pieces) / 20
+	numPieces := len(p.Pieces) / 20
 
 	// Piece size when file size is not divisible by pieceLength
-	pieceSize := t.Info.PieceLength
-	if pieceIdx == numPieces-1 && t.Info.Length%t.Info.PieceLength != 0 {
-		pieceSize = t.Info.Length % t.Info.PieceLength
+	pieceSize := p.PieceLength
+	if pieceIdx == numPieces-1 && p.Length%p.PieceLength != 0 {
+		pieceSize = p.Length % p.PieceLength
 	}
 
 	blockSize := 1 << 14                                 // 2^14, 16KB
 	numBlocks := (pieceSize + blockSize - 1) / blockSize // ceiling
+
+	fmt.Println("numPieces:", numPieces, "numBlocks:", numBlocks)
 
 	pieceBytes := make([]byte, pieceSize)
 
@@ -326,6 +326,8 @@ func (t *TorrentFile) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error)
 		if err != nil {
 			return nil, err
 		}
+
+		fmt.Println("Requested blockIdx:", blockIdx)
 	}
 
 	// Wait for each 'piece' message
@@ -339,16 +341,18 @@ func (t *TorrentFile) downloadPiece(conn net.Conn, pieceIdx int) ([]byte, error)
 			return nil, fmt.Errorf("expecting a 'unchoke' message")
 		}
 
-		_ = binary.BigEndian.Uint32(pieceMessage.Payload[0:4]) // recvIdx
+		recvIdx := binary.BigEndian.Uint32(pieceMessage.Payload[0:4]) // recvIdx
 		recvBegin := binary.BigEndian.Uint32(pieceMessage.Payload[4:8])
 		block := pieceMessage.Payload[8:]
 
 		copy(pieceBytes[recvBegin:], block)
+
+		fmt.Println("Received blockIdx:", recvIdx, "begin:", recvBegin)
 	}
 
 	// Verify the downloaded piece
 	recvHash := sha1.Sum(pieceBytes)
-	pieceHash := t.Info.Pieces[pieceIdx*20 : pieceIdx*20+20]
+	pieceHash := p.Pieces[pieceIdx*20 : pieceIdx*20+20]
 	if recvHash != [20]byte(pieceHash) {
 		return nil, fmt.Errorf("expecting: %x,Received: %x", pieceHash, recvHash)
 	}
@@ -375,7 +379,7 @@ func (t *TorrentFile) worker(jobQueue chan int, peerChan chan string, resultChan
 			conns[peer] = conn
 		}
 
-		pieceBytes, err := t.downloadPiece(conn, pieceIdx)
+		pieceBytes, err := t.Info.downloadPiece(conn, pieceIdx)
 		if err != nil {
 			// Close and remove bad connection
 			conn.Close()
@@ -443,6 +447,35 @@ func (m *Magnet) announceMagnet() (*AnnounceResponse, error) {
 }
 
 func (m *Magnet) connectPeer(peer string) (net.Conn, string, int, error) {
+	conn, peerId, extId, err := m.extensionHandshake(peer)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// Send an 'interested' message
+	interestedMessage := &PeerMessage{
+		Length:    1,
+		MessageId: 2,
+		Payload:   []byte{},
+	}
+	_, err = sendMessage(conn, interestedMessage)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// Wait for an 'unchoke' message
+	unchokeMessage, err := receiveMessage(conn)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if unchokeMessage.MessageId != 1 {
+		return nil, "", 0, fmt.Errorf("expecting a 'unchoke' message")
+	}
+
+	return conn, peerId, extId, nil
+}
+
+func (m *Magnet) extensionHandshake(peer string) (net.Conn, string, int, error) {
 	// Establish a TCP connection with a peer
 	conn, err := net.Dial("tcp", peer)
 	if err != nil {
@@ -466,24 +499,23 @@ func (m *Magnet) connectPeer(peer string) (net.Conn, string, int, error) {
 		return nil, "", 0, fmt.Errorf("expecting a 'bitfield' message")
 	}
 
-	if !isPeerExtEnabled {
-		return nil, "", 0, fmt.Errorf("expecting extension enabled peer")
-	}
+	extId := 0
+	if isPeerExtEnabled {
+		// Extension handshake with peer (if enabled)
+		encodedResp, err := extHandShake(conn)
+		if err != nil {
+			return nil, "", 0, err
+		}
 
-	// Extension handshake with peer (if enabled)
-	encodedResp, err := extHandShake(conn)
-	if err != nil {
-		return nil, "", 0, err
-	}
+		// skip the handshake extension message id 0
+		decoder := NewBencodeDecoder(encodedResp.Payload[1:])
+		resp, err := decoder.decodeDictionary()
+		if err != nil {
+			return nil, "", 0, err
+		}
 
-	// skip the handshake extension message id 0
-	decoder := NewBencodeDecoder(encodedResp.Payload[1:])
-	resp, err := decoder.decodeDictionary()
-	if err != nil {
-		return nil, "", 0, err
+		extId = resp["m"].(map[string]any)["ut_metadata"].(int)
 	}
-
-	extId := resp["m"].(map[string]any)["ut_metadata"].(int)
 
 	return conn, fmt.Sprintf("%x", peerID), extId, nil
 }
@@ -529,35 +561,43 @@ func extHandShake(conn net.Conn) (*PeerMessage, error) {
 	return recvExtMessage, nil
 }
 
-func requestMetadata(conn net.Conn, extId int) (map[string]any, map[string]any, error) {
+func requestMetadata(conn net.Conn, extId int) (*InfoDict, error) {
 	encoder := NewBencodeEncoder()
 
+	// request message
 	reqMsg := map[string]any{"msg_type": 0, "piece": 0}
 	err := encoder.encodeDict(reqMsg)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	payload := []byte{byte(extId)}
 	payload = append(payload, encoder.data...)
 
-	metadataMsg, err := sendExtensionMsg(conn, payload)
+	// Request and receive metadata
+	encodedDataMsg, err := sendExtensionMsg(conn, payload)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	decoder := NewBencodeDecoder(metadataMsg.Payload[1:])
-	metadataResp, err := decoder.decodeDictionary()
+	decoder := NewBencodeDecoder(encodedDataMsg.Payload[1:])
+	_, err = decoder.decodeDictionary()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	metadataPieceResp, err := decoder.decodeDictionary()
+	pieceResp, err := decoder.decodeDictionary()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return metadataResp, metadataPieceResp, nil
+	info := &InfoDict{
+		Length:      pieceResp["length"].(int),
+		Name:        pieceResp["name"].(string),
+		PieceLength: pieceResp["piece length"].(int),
+		Pieces:      []byte(pieceResp["pieces"].(string)),
+	}
+	return info, nil
 }
 
 func main() {
@@ -672,7 +712,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		pieceBytes, err := torrent.downloadPiece(conn, pieceIdx)
+		pieceBytes, err := torrent.Info.downloadPiece(conn, pieceIdx)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -778,7 +818,7 @@ func main() {
 			return
 		}
 
-		_, peerId, extId, err := magnet.connectPeer(announceResponse.Peers[0])
+		_, peerId, extId, err := magnet.extensionHandshake(announceResponse.Peers[0])
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -801,29 +841,84 @@ func main() {
 			return
 		}
 
-		conn, _, extId, err := magnet.connectPeer(announceResponse.Peers[0])
+		conn, _, extId, err := magnet.extensionHandshake(announceResponse.Peers[0])
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		_, pieceResp, err := requestMetadata(conn, extId)
+		pieceInfo, err := requestMetadata(conn, extId)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
 		fmt.Println("Tracker URL:", magnet.TrackerUrl)
-		fmt.Println("Length:", pieceResp["length"])
+		fmt.Println("Length:", pieceInfo.Length)
 		fmt.Printf("Info Hash: %x\n", magnet.InfoHash)
-		fmt.Println("Piece Length:", pieceResp["piece length"])
+		fmt.Println("Piece Length:", pieceInfo.PieceLength)
 		fmt.Println("Piece Hashes:")
+
 		idx := 0
-		piecesBytes := []byte(pieceResp["pieces"].(string))
-		for idx < len(piecesBytes) {
-			fmt.Printf("%x\n", piecesBytes[idx:idx+20])
+		for idx < len(pieceInfo.Pieces) {
+			fmt.Printf("%x\n", pieceInfo.Pieces[idx:idx+20])
 			idx += 20
 		}
+
+	case "magnet_download_piece":
+		dest := os.Args[3]
+		magnetLink := os.Args[4]
+		pieceIdx, err := strconv.Atoi(os.Args[5])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		magnet, err := ParseMagnet(magnetLink)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		announceResponse, err := magnet.announceMagnet()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		conn, _, extId, err := magnet.connectPeer(announceResponse.Peers[0])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		pieceInfo, err := requestMetadata(conn, extId)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		pieceBytes, err := pieceInfo.downloadPiece(conn, pieceIdx)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Create the file
+		file, err := os.Create(dest)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(pieceBytes)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		fmt.Println("Downloaded and verified pieceIdx:", pieceIdx)
 
 	default:
 		fmt.Println("Unknown command: " + command)
