@@ -442,6 +442,72 @@ func (m *Magnet) announceMagnet() (*AnnounceResponse, error) {
 	return announceRequest(m.TrackerUrl, m.InfoHash, 10)
 }
 
+func (m *Magnet) connectPeer(peer string) (net.Conn, string, int, error) {
+	// Establish a TCP connection with a peer
+	conn, err := net.Dial("tcp", peer)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// Base handshake with peer
+	peerID, isPeerExtEnabled, err := handShake(conn, m.InfoHash, true)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// No need to send 'bitfield' message to peer for this challenge
+	// Wait for a 'bitfield' message
+	bitfieldMessage, err := receiveMessage(conn)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	if bitfieldMessage.MessageId != 5 {
+		return nil, "", 0, fmt.Errorf("expecting a 'bitfield' message")
+	}
+
+	if !isPeerExtEnabled {
+		return nil, "", 0, fmt.Errorf("expecting extension enabled peer")
+	}
+
+	// Extension handshake with peer (if enabled)
+	encodedResp, err := extHandShake(conn)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// skip the handshake extension message id 0
+	decoder := NewBencodeDecoder(encodedResp.Payload[1:])
+	resp, err := decoder.decodeDictionary()
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	extId := resp["m"].(map[string]any)["ut_metadata"].(int)
+
+	return conn, fmt.Sprintf("%x", peerID), extId, nil
+}
+
+func sendExtensionMsg(conn net.Conn, payload []byte) (*PeerMessage, error) {
+	request := &PeerMessage{
+		Length:    uint32(len(payload) + 1),
+		MessageId: 20, // Extension Message ID
+		Payload:   payload,
+	}
+
+	_, err := sendMessage(conn, request)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := receiveMessage(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
 func extHandShake(conn net.Conn) (*PeerMessage, error) {
 	encoder := NewBencodeEncoder()
 
@@ -455,23 +521,38 @@ func extHandShake(conn net.Conn) (*PeerMessage, error) {
 	payload := []byte{0} // extension message id 0
 	payload = append(payload, encoder.data...)
 
-	message := &PeerMessage{
-		Length:    uint32(len(payload) + 1),
-		MessageId: 20, // Extension Message ID
-		Payload:   payload,
-	}
-
-	_, err = sendMessage(conn, message)
-	if err != nil {
-		return nil, err
-	}
-
-	recvExtMessage, err := receiveMessage(conn)
+	recvExtMessage, err := sendExtensionMsg(conn, payload)
 	if err != nil {
 		return nil, err
 	}
 
 	return recvExtMessage, nil
+}
+
+func requestMetadata(conn net.Conn, extId int) (map[string]any, error) {
+	encoder := NewBencodeEncoder()
+
+	reqMsg := map[string]any{"msg_type": 0, "piece": 0}
+	err := encoder.encodeDict(reqMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	payload := []byte{byte(extId)}
+	payload = append(payload, encoder.data...)
+
+	metadataMsg, err := sendExtensionMsg(conn, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := NewBencodeDecoder(metadataMsg.Payload[1:])
+	response, err := decoder.decodeDictionary()
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
 }
 
 func main() {
@@ -692,53 +773,42 @@ func main() {
 			return
 		}
 
-		// Establish a TCP connection with a peer
-		conn, err := net.Dial("tcp", announceResponse.Peers[0])
+		_, peerId, extId, err := magnet.connectPeer(announceResponse.Peers[0])
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		// Base handshake with peer
-		peerID, isPeerExtEnabled, err := handShake(conn, magnet.InfoHash, true)
+		fmt.Println("Peer Metadata Extension ID:", extId)
+		fmt.Printf("Peer ID: %s\n", peerId)
+
+	case "magnet_info":
+		magnetLink := os.Args[2]
+		magnet, err := ParseMagnet(magnetLink)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		// No need to send 'bitfield' message to peer for this challenge
-		// Wait for a 'bitfield' message
-		bitfieldMessage, err := receiveMessage(conn)
+		announceResponse, err := magnet.announceMagnet()
 		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
-		if bitfieldMessage.MessageId != 5 {
-			fmt.Println("expecting a 'bitfield' message")
+		conn, _, extId, err := magnet.connectPeer(announceResponse.Peers[0])
+		if err != nil {
+			fmt.Println(err)
 			return
 		}
 
-		// Extension handshake with peer (if enabled)
-		if isPeerExtEnabled {
-			encodedResp, err := extHandShake(conn)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-
-			// skip the handshake extension message id 0
-			decoder := NewBencodeDecoder(encodedResp.Payload[1:])
-			resp, err := decoder.decodeDictionary()
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-
-			peerMetadataExtId := resp["m"].(map[string]any)["ut_metadata"]
-			fmt.Println("Peer Metadata Extension ID:", peerMetadataExtId)
+		metadataResp, err := requestMetadata(conn, extId)
+		if err != nil {
+			fmt.Println(err)
+			return
 		}
 
-		fmt.Printf("Peer ID: %x\n", peerID)
+		fmt.Println(metadataResp)
 
 	default:
 		fmt.Println("Unknown command: " + command)
